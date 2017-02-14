@@ -1,0 +1,4 @@
+probe generic.fop.open{ 
+    if(filename == "profile")
+         printf("%s is opening my file: %s\n", execname(), filename);
+}

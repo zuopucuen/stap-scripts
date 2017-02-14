@@ -1,0 +1,292 @@
+#!/usr/bin/env stap
+/**
+ * cfstrace.stp
+ * 
+ * Traces context switching by CFS scheduler
+ * Usage: 
+ *      сfstrace.stp CPU
+ * 
+ * Tested on Linux 3.10 (CentOS 7)
+ */
+
+/* Global parameters */
+global be_verbose = 1;
+global print_cfs_tree = 1;
+
+global pnetime;
+global cpetrace;
+
+global trace_cpu;
+
+global policy_names;
+
+global cpu_cfs_rq;
+global rq_curr;
+global rq_clock_task;
+
+/* get_task_se returns task_struct corresponding to scheduler entity se*/
+function get_task_se:long(se:long) {
+    offset = &@cast(0, "struct task_struct")->se;    
+    return se - offset;
+}
+
+/* get_task_se returns sched_entity for task */
+function get_se_task:long(task:long) {
+    offset = &@cast(0, "struct task_struct")->se;
+    return task +  offset;
+}
+
+/* get_rb_se returns sched_entity for red-black node */
+function get_rb_se:long(rb:long) {
+    offset = &@cast(0, "struct sched_entity")->run_node;
+    return rb - offset;
+}
+
+/* formats pretty string for task_struct t */
+function sprint_task(t:long) {
+    policy = @cast(t, "struct task_struct")->policy;
+    return sprintf("t: %p %s/%d %s", t, task_execname(t), task_tid(t),
+                    policy_names[policy]);
+}
+
+/* Generates CGroup or autogrou path for CFS run-queue */
+function sprint_cfs_rq_path(cfs_rq:long) {
+    tg = @cast(cfs_rq, "struct cfs_rq")->tg;        
+    if(!tg)
+        return "???";
+
+%( CONFIG_SCHED_AUTOGROUP == "y"
+%?
+    if(@cast(tg, "struct task_group")->autogroup) {
+        return sprintf("/autogroup-%d", 
+                       @cast(tg, "struct task_group")->autogroup->id);
+    }
+%)
+
+    cgroup = @cast(tg, "struct task_group")->css->cgroup;
+    
+    try {
+        return reverse_path_walk(@cast(cgroup, "struct cgroup")->dentry);
+    }
+    catch {
+        return "/???";
+    }
+}
+
+/* formats relative representation of vruntime */
+function sprint_vruntime(se:long, min_vruntime:long) {
+    vruntime = @cast(se, "struct sched_entity")->vruntime;
+    if(min_vruntime)
+        return sprintf("MIN+%d", vruntime - min_vruntime);
+    else
+        return sprintf("%d", vruntime);
+}
+
+/* Prints information about sched_entity se */
+function print_se(s:string, se:long, verbose:long, min_vruntime:long) {
+    printf("\tse:%8s ", s);
+    
+    my_q = @cast(se, "struct sched_entity")->my_q;
+    
+    if(my_q == 0) {    
+        println(sprint_task(get_task_se(se)));
+    } else {
+        printf("se: %p my_q: %p %s", se, my_q, sprint_cfs_rq_path(my_q));
+    }
+    
+    if(verbose) {
+        printf("\t\tload.weight: %d exec_start: RQ+%d vruntime: %s sum_exec_runtime: %d\n",
+               @cast(se, "struct sched_entity")->load->weight,
+               rq_clock_task - @cast(se, "struct sched_entity")->exec_start,
+               sprint_vruntime(se, min_vruntime), 
+               @cast(se, "struct sched_entity")->sum_exec_runtime);
+    }
+}
+
+/* Prints information about cfs_rq run-queue */
+function print_cfs_rq(cfs_rq:long, verbose:long) {
+    firstrb = @cast(cfs_rq, "struct cfs_rq")->rb_leftmost;
+    skip = @cast(cfs_rq, "struct cfs_rq")->skip;
+    last = @cast(cfs_rq, "struct cfs_rq")->last;
+    nextse = @cast(cfs_rq, "struct cfs_rq")->next;
+    min_vruntime = @cast(cfs_rq, "struct cfs_rq")->min_vruntime;
+    
+    printf("\tCFS_RQ: %s\n", sprint_cfs_rq_path(cfs_rq));
+
+    if(verbose) {
+        printf("\t\tnr_running: %d load.weight: %d min_vruntime: %d\n",
+            @cast(cfs_rq, "struct cfs_rq")->nr_running, 
+            @cast(cfs_rq, "struct cfs_rq")->load->weight,
+            @cast(cfs_rq, "struct cfs_rq")->min_vruntime);
+        if(@defined(@cast(cfs_rq, "struct cfs_rq")->runnable_load_avg)) {
+            printf("\t\trunnable_load_avg: %d blocked_load_avg: %d \n",
+                   @cast(cfs_rq, "struct cfs_rq")->runnable_load_avg, 
+                   @cast(cfs_rq, "struct cfs_rq")->blocked_load_avg);
+        }
+        else {
+            printf("\t\tload_avg: %d\n",
+                   @cast(cfs_rq, "struct cfs_rq")->load_avg);
+        }
+    }
+    
+    if(firstrb) {
+        firstse = get_rb_se(firstrb);
+        print_se("first", firstse, verbose, min_vruntime);
+    }
+    
+    if(skip) print_se("skip", skip, 0, min_vruntime);
+    if(last) print_se("last", last, 0, min_vruntime);
+    if(nextse) print_se("next", nextse, 0, min_vruntime);
+        
+    if(print_cfs_tree)
+        dump_cfs_rq(cpu_cfs_rq, be_verbose, min_vruntime);
+}
+
+function dump_cfs_rq_rb(indstr:string, rb:long, verbose:long, min_vruntime:long) {
+    left  = @cast(rb, "struct rb_node")->rb_left;
+    right = @cast(rb, "struct rb_node")->rb_right;
+    
+    print_se(sprintf("%s:", indstr), get_rb_se(rb), verbose, min_vruntime);
+    
+    if(left) dump_cfs_rq_rb(sprintf("%s-l", indstr), left, verbose, min_vruntime);
+    if(right) dump_cfs_rq_rb(sprintf("%s-r", indstr), right, verbose, min_vruntime);
+}
+
+/* Prints tree tasks_timeline for  cfs_rq */
+function dump_cfs_rq(cfs_rq:long, verbose:long, min_vruntime:long) {
+    root = @cast(cfs_rq, "struct cfs_rq")->tasks_timeline->rb_node;
+    
+    if(root)
+        dump_cfs_rq_rb("rb", root, verbose, min_vruntime);
+}
+
+probe begin {
+    pnetime = local_clock_ns();
+    cpu_cfs_rq = 0;    rq_curr = 0;
+
+    trace_cpu = $1;
+
+    printf("Tracing CPU%d...\n", trace_cpu);
+
+    policy_names[0] = "SCHED_NORMAL";   policy_names[1] = "SCHED_FIFO";
+    policy_names[2] = "SCHED_RR";       policy_names[3] = "SCHED_BATCH";
+    policy_names[4] = "SCHED_ISO";      policy_names[5] = "SCHED_IDLE";
+}
+
+/* pick_next_task_fair tries to find next task for execution. 
+
+   pick_next_entity - picks "next" entity from cfs_rq. If it returns another
+   CGroup, not a task, pick_next_task_fair calls it again unless task is returned*/
+probe kernel.function("pick_next_task_fair") {
+    if(cpu() != trace_cpu) next;
+    
+    pnetime2 = local_clock_ns();
+    printf("=> pick_next_task_fair D=%d J=%d\n", pnetime2 - pnetime, $jiffies);
+    
+    pnetime = pnetime2;
+    cpu_cfs_rq = &$rq->cfs;
+}
+
+probe kernel.function("pick_next_task_fair").return {
+    if(cpu() != trace_cpu || cpu_cfs_rq == 0) next;
+    
+    printf("<= pick_next_task_fair\n");
+
+    if($return != 0) {
+        se = &$return->se;
+        print_se("sched", se, 0,
+                 @cast(cpu_cfs_rq, "struct cfs_rq")->min_vruntime);
+    }
+    
+    println("");
+    cpu_cfs_rq = 0;
+}
+
+probe kernel.function("pick_next_entity") {    
+    if(cpu() != trace_cpu || cpu_cfs_rq == 0) next;
+    
+    printf("\tpick_next_entity\n");
+    print_cfs_rq(cpu_cfs_rq, be_verbose);   
+}
+
+/* task_tick_fair - called by system timer */
+probe kernel.function("task_tick_fair") {  
+    if(cpu() != trace_cpu) next;
+
+    printf("=> task_tick_fair J=%d queued: %d curr: %s\n", $jiffies, $queued, 
+           sprint_task($curr));
+
+    rq_curr = get_se_task($curr);
+    cpu_cfs_rq = &$rq->cfs;
+}
+
+probe kernel.function("sched_slice").return {
+    if(cpu() != trace_cpu) next;
+
+    printf("\tsched_slice: %d\n", $return);
+}
+
+probe kernel.function("task_tick_fair").return {
+    if(cpu() != trace_cpu) next;
+    
+    print_se("curr", rq_curr, be_verbose,
+             @cast(cpu_cfs_rq, "struct cfs_rq")->min_vruntime);
+    printf("\t\tdelta_exec: %d\n", 
+            @cast(rq_curr, "struct sched_entity")->sum_exec_runtime - 
+            @cast(rq_curr, "struct sched_entity")->prev_sum_exec_runtime);
+    
+    firstrb = @cast(cpu_cfs_rq, "struct cfs_rq")->rb_leftmost;
+    if(firstrb) {
+        firstse = get_rb_se(firstrb);
+        printf("\t\tdelta: %d\n", 
+            @cast(rq_curr, "struct sched_entity")->vruntime - 
+            @cast(firstse, "struct sched_entity")->vruntime);
+    }
+
+    cpu_cfs_rq = 0;
+    rq_curr = 0;
+
+    println("<= task_tick_fair\n");
+}
+
+/* check_preempt_wakeup - checks if tasks that waking up can preempt current task */
+probe kernel.function("check_preempt_wakeup") {
+    if(cpu() != trace_cpu) next;
+    cpetrace = 1;
+       
+    cpu_cfs_rq = &$rq->cfs;
+    min_vruntime = @cast(cpu_cfs_rq, "struct cfs_rq")->min_vruntime;
+
+    t_curr = task_current();
+    t_se = $p;
+
+    println("=> check_preempt_wakeup:");
+    print_se("curr", get_se_task(t_curr), be_verbose, min_vruntime);   
+    print_se("se", get_se_task(t_se), be_verbose, min_vruntime);
+}
+
+probe kernel.function("check_preempt_wakeup").return {
+    if(cpu() != trace_cpu) next;
+    
+    cpetrace = 0;
+
+    print_cfs_rq(cpu_cfs_rq, be_verbose);   
+    println("<= check_preempt_wakeup\n");
+}
+
+/* resched_task - reschedule task. Replaced by resched_curr in modern kernels. */
+probe kernel.function("resched_task") {
+    if(cpu() != trace_cpu || cpetrace == 0) next;
+    
+    if(@defined($p)) 
+       task_string = sprint_task($p)
+    else 
+       task_string = "???";
+    
+    printf("\tresched_task %s\n", task_string);
+}
+/*
+probe kernel.function("update_rq_clock").return {
+    rq_clock_task = $rq->clock_task;
+}
+*/

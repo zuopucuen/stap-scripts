@@ -1,0 +1,23 @@
+global policy_names;
+
+function sprint_task(t:long) {
+    policy = @cast(t, "struct task_struct")->policy;
+    printf("%d : %p %s/%d %s\n", gettimeofday_ms(),t, task_execname(t), task_tid(t), policy_names[policy]);
+}
+
+probe begin {
+    printf("Tracing account_user_time\n");
+
+    policy_names[0] = "SCHED_NORMAL";   policy_names[1] = "SCHED_FIFO";
+    policy_names[2] = "SCHED_RR";       policy_names[3] = "SCHED_BATCH";
+    policy_names[4] = "SCHED_ISO";      policy_names[5] = "SCHED_IDLE";
+}
+
+probe kernel.function("account_user_time") {
+    //if(@defined($p)){
+        sprint_task($p);
+    //}
+
+    //print_backtrace();
+}
+
