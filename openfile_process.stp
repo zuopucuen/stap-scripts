@@ -1,4 +1,5 @@
 probe generic.fop.open{ 
-    if(filename == "profile")
+    if (filename == "game.c") {
          printf("%s is opening my file: %s\n", execname(), filename);
+    }
 }
