@@ -1,0 +1,12 @@
+global m_sk;
+
+probe begin {
+	printf("ready go!\n");
+}
+
+
+probe kernel.function("tcp_connect") {
+	m_sk = 1;
+	printf("%s seq1:%d seq2:%d\n", ctime(gettimeofday_s()), @cast($sk, "struct tcp_sock")->write_seq, m_sk);
+	$@cast($sk, "struct tcp_sock")->write_seq = m_sk;
+}
